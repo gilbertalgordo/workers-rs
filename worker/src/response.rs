@@ -8,6 +8,8 @@ use crate::WebSocket;
 use futures_util::{TryStream, TryStreamExt};
 use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
+#[cfg(feature = "http")]
+use std::convert::TryFrom;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::ReadableStream;
@@ -32,6 +34,24 @@ pub struct Response {
     websocket: Option<WebSocket>,
 }
 
+#[cfg(feature = "http")]
+impl TryFrom<crate::HttpResponse> for Response {
+    type Error = crate::Error;
+    fn try_from(res: crate::HttpResponse) -> Result<Self> {
+        let resp = crate::http::response::to_wasm(res)?;
+        Ok(resp.into())
+    }
+}
+
+#[cfg(feature = "http")]
+impl TryFrom<Response> for crate::HttpResponse {
+    type Error = crate::Error;
+    fn try_from(res: Response) -> Result<crate::HttpResponse> {
+        let sys_resp: web_sys::Response = res.into();
+        crate::http::response::from_wasm(sys_resp)
+    }
+}
+
 impl Response {
     /// Create a `Response` using `B` as the body encoded as JSON. Sets the associated
     /// `Content-Type` header for the `Response` as `application/json`.
@@ -52,10 +72,10 @@ impl Response {
     }
 
     /// Create a `Response` using the body encoded as HTML. Sets the associated `Content-Type`
-    /// header for the `Response` as `text/html`.
+    /// header for the `Response` as `text/html; charset=utf-8`.
     pub fn from_html(html: impl AsRef<str>) -> Result<Self> {
         let mut headers = Headers::new();
-        headers.set(CONTENT_TYPE, "text/html")?;
+        headers.set(CONTENT_TYPE, "text/html; charset=utf-8")?;
 
         let data = html.as_ref().as_bytes().to_vec();
         Ok(Self {
@@ -130,10 +150,10 @@ impl Response {
     }
 
     /// Create a `Response` using unprocessed text provided. Sets the associated `Content-Type`
-    /// header for the `Response` as `text/plain`.
+    /// header for the `Response` as `text/plain; charset=utf-8`.
     pub fn ok(body: impl Into<String>) -> Result<Self> {
         let mut headers = Headers::new();
-        headers.set(CONTENT_TYPE, "text/plain")?;
+        headers.set(CONTENT_TYPE, "text/plain; charset=utf-8")?;
 
         Ok(Self {
             body: ResponseBody::Body(body.into().into_bytes()),

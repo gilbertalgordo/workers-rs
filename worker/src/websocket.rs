@@ -21,6 +21,9 @@ pub struct WebSocketPair {
     pub server: WebSocket,
 }
 
+unsafe impl Send for WebSocketPair {}
+unsafe impl Sync for WebSocketPair {}
+
 impl WebSocketPair {
     /// Creates a new `WebSocketPair`.
     pub fn new() -> Result<Self> {
@@ -36,6 +39,9 @@ impl WebSocketPair {
 pub struct WebSocket {
     socket: web_sys::WebSocket,
 }
+
+unsafe impl Send for WebSocket {}
+unsafe impl Sync for WebSocket {}
 
 impl WebSocket {
     /// Attempts to establish a [`WebSocket`] connection to the provided [`Url`].
@@ -63,7 +69,21 @@ impl WebSocket {
     ///
     /// Response::error("never got a message echoed back :(", 500)
     /// ```
-    pub async fn connect(mut url: Url) -> Result<WebSocket> {
+    pub async fn connect(url: Url) -> Result<WebSocket> {
+        WebSocket::connect_with_protocols(url, None).await
+    }
+
+    /// Attempts to establish a [`WebSocket`] connection to the provided [`Url`] and protocol.
+    ///
+    /// # Example:
+    /// ```rust,ignore
+    /// let ws = WebSocket::connect_with_protocols("wss://echo.zeb.workers.dev/".parse()?, Some(vec!["GiggleBytes"])).await?;
+    ///
+    /// ```
+    pub async fn connect_with_protocols(
+        mut url: Url,
+        protocols: Option<Vec<&str>>,
+    ) -> Result<WebSocket> {
         let scheme: String = match url.scheme() {
             "ws" => "http".into(),
             "wss" => "https".into(),
@@ -76,6 +96,14 @@ impl WebSocket {
 
         let mut req = Request::new(url.as_str(), Method::Get)?;
         req.headers_mut()?.set("upgrade", "websocket")?;
+
+        match protocols {
+            None => {}
+            Some(v) => {
+                req.headers_mut()?
+                    .set("Sec-WebSocket-Protocol", v.join(",").as_str())?;
+            }
+        }
 
         let res = Fetch::Request(req).send().await?;
 
@@ -196,6 +224,24 @@ impl WebSocket {
             closed: false,
             closures: Some((message_closure, error_closure, close_closure)),
         })
+    }
+
+    pub fn serialize_attachment<T: Serialize>(&self, value: T) -> Result<()> {
+        self.socket
+            .serialize_attachment(serde_wasm_bindgen::to_value(&value)?)
+            .map_err(Error::from)
+    }
+
+    pub fn deserialize_attachment<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>> {
+        let value = self.socket.deserialize_attachment().map_err(Error::from)?;
+
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+
+        serde_wasm_bindgen::from_value::<T>(value)
+            .map(Some)
+            .map_err(Error::from)
     }
 }
 

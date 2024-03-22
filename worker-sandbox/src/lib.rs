@@ -1,3 +1,9 @@
+use blake2::{Blake2b512, Digest};
+use futures_util::{future::Either, StreamExt, TryStreamExt};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "http")]
+use std::convert::TryInto;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -5,11 +11,6 @@ use std::{
     },
     time::Duration,
 };
-
-use blake2::{Blake2b512, Digest};
-use futures_util::{future::Either, StreamExt, TryStreamExt};
-use rand::Rng;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use worker::*;
 
@@ -59,8 +60,10 @@ fn handle_a_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<Response> 
     Response::ok(format!(
         "req at: {}, located at: {:?}, within: {}",
         req.path(),
-        req.cf().coordinates().unwrap_or_default(),
-        req.cf().region().unwrap_or_else(|| "unknown region".into())
+        req.cf().map(|cf| cf.coordinates().unwrap_or_default()),
+        req.cf()
+            .map(|cf| cf.region().unwrap_or_else(|| "unknown region".into()))
+            .unwrap_or(String::from("No CF properties"))
     ))
 }
 
@@ -68,8 +71,10 @@ async fn handle_async_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<
     Response::ok(format!(
         "[async] req at: {}, located at: {:?}, within: {}",
         req.path(),
-        req.cf().coordinates().unwrap_or_default(),
-        req.cf().region().unwrap_or_else(|| "unknown region".into())
+        req.cf().map(|cf| cf.coordinates().unwrap_or_default()),
+        req.cf()
+            .map(|cf| cf.region().unwrap_or_else(|| "unknown region".into()))
+            .unwrap_or(String::from("No CF properties"))
     ))
 }
 
@@ -88,15 +93,33 @@ pub fn start() {
     GLOBAL_STATE.store(true, Ordering::SeqCst);
 }
 
+#[cfg(feature = "http")]
+type HandlerRequest = HttpRequest;
+#[cfg(not(feature = "http"))]
+type HandlerRequest = Request;
+#[cfg(feature = "http")]
+type HandlerResponse = HttpResponse;
+#[cfg(not(feature = "http"))]
+type HandlerResponse = Response;
+
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
+pub async fn main(
+    request: HandlerRequest,
+    env: Env,
+    _ctx: worker::Context,
+) -> Result<HandlerResponse> {
     let data = SomeSharedData {
         regex: regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(),
     };
 
     let router = Router::with_data(data); // if no data is needed, pass `()` or any other valid data
 
-    router
+    #[cfg(feature = "http")]
+    let req: Request = request.try_into()?;
+    #[cfg(not(feature = "http"))]
+    let req = request;
+
+    let worker_response = router
         .get("/request", handle_a_request) // can pass a fn pointer to keep routes tidy
         .get_async("/async-request", handle_async_request)
         .get("/websocket", |_, ctx| {
@@ -146,7 +169,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             Response::ok(got_close_event)
         })
         .get_async("/ws-client", |_, _| async move {
-            let ws = WebSocket::connect("wss://echo.zeb.workers.dev/".parse()?).await?;
+            let ws = WebSocket::connect("wss://echo.miniflare.mocks/".parse()?).await?;
 
             // It's important that we call this before we send our first message, otherwise we will
             // not have any event listeners on the socket to receive the echoed message.
@@ -352,8 +375,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             ))
         })
         .get_async("/proxy_request/*url", |_req, ctx| async move {
-            let url = ctx.param("url").unwrap().strip_prefix('/').unwrap();
-
+            let url = ctx.param("url").unwrap();
             Fetch::Url(url.parse()?).send().await
         })
         .get_async("/durable/alarm", |_req, ctx| async move {
@@ -371,6 +393,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             // compatibility flag can be provided in wrangler.toml to opt-in to older behavior:
             // https://developers.cloudflare.com/workers/platform/compatibility-dates#durable-object-stubfetch-requires-a-full-url
             stub.fetch_with_str("https://fake-host/").await
+        })
+        .get_async("/durable/put-raw", |req, ctx| async move {
+            let namespace = ctx.durable_object("PUT_RAW_TEST_OBJECT")?;
+            let id = namespace.unique_id()?;
+            let stub = id.get_stub()?;
+            stub.fetch_with_request(req).await
         })
         .get("/secret", |_req, ctx| {
             Response::ok(ctx.secret("SOME_SECRET")?.to_string())
@@ -480,7 +508,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             let signal = controller.signal();
 
             let fetch_fut = async {
-                let fetch = Fetch::Url("https://delay.zeb.workers.dev/".parse().unwrap());
+                let fetch = Fetch::Url("https://miniflare.mocks/delay".parse().unwrap());
                 let mut res = fetch.send_with_signal(&signal).await?;
                 let text = res.text().await?;
                 Ok::<String, worker::Error>(text)
@@ -661,14 +689,33 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         })
         .get_async("/remote-by-request", |req, ctx| async move {
             let fetcher = ctx.service("remote")?;
-            fetcher.fetch_request(req).await
+
+            #[cfg(feature="http")]
+            let http_request = req.try_into()?;
+            #[cfg(not(feature="http"))]
+            let http_request = req;
+
+            let response = fetcher.fetch_request(http_request).await?;
+
+            #[cfg(feature="http")]
+            let result = Ok(TryInto::<worker::Response>::try_into(response)?);
+            #[cfg(not(feature="http"))]
+            let result = Ok(response);
+
+            result
         })
         .get_async("/remote-by-path", |req, ctx| async move {
             let fetcher = ctx.service("remote")?;
             let mut init = RequestInit::new();
             init.with_method(Method::Post);
+            let response = fetcher.fetch(req.url()?.to_string(), Some(init)).await?;
 
-            fetcher.fetch(req.url()?.to_string(), Some(init)).await
+            #[cfg(feature="http")]
+            let result = Ok(TryInto::<worker::Response>::try_into(response)?);
+            #[cfg(not(feature="http"))]
+            let result = Ok(response);
+
+            result
         })
         .post_async("/queue/send/:id", |_req, ctx| async move {
             let id = match ctx.param("id").map(|id|Uuid::try_parse(id).ok()).and_then(|u|u) {
@@ -724,7 +771,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 .map(|resp| resp.with_status(404))
         })
         .run(req, env)
-        .await
+        .await;
+    #[cfg(feature = "http")]
+    let res = worker_response.map(|r| r.try_into())?;
+    #[cfg(not(feature = "http"))]
+    let res = worker_response;
+    res
 }
 
 fn respond<D>(req: Request, _ctx: RouteContext<D>) -> Result<Response> {
